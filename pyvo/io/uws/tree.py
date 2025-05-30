@@ -97,6 +97,7 @@ class JobSummary(Element):
         self._results = Results()
         self._errorsummary = None
         self._message = None
+        self._jobinfo = None
 
     @uwselement(name='jobId', plain=True)
     def jobid(self):
@@ -268,6 +269,17 @@ class JobSummary(Element):
         res = ErrorSummary(config, pos, 'errorSummary', **data)
         res.parse(iterator, config)
         self._errorsummary = res
+
+    @uwselement(name='jobInfo')
+    def jobinfo(self):
+        """Implementation-specific job information"""
+        return self._jobinfo
+
+    @jobinfo.adder
+    def jobinfo(self, iterator, tag, data, config, pos):
+        jobinfo = JobInfo(config, pos, 'jobInfo', **data)
+        jobinfo.parse(iterator, config)
+        self._jobinfo = jobinfo
 
 
 class Jobs(HomogeneousList, UWSElement):
@@ -441,4 +453,22 @@ class ErrorSummary(UWSElement):
 class Message(ContentMixin, UWSElement):
     """The actual UWS Error message."""
     def __init__(self, config=None, pos=None, _name='message', **kwargs):
+        super().__init__(config, pos, _name, **kwargs)
+
+
+class ExtensibleUWSElement(UWSElement):
+    """Extensible UWS Element, with the main feature being silently
+    handling unknown tags."""
+    def _add_unknown_tag(self, iterator, tag, data, config, pos):
+        """Silently handle unknown tags"""
+        tag_name = tag.split('}')[-1] if '}' in tag else tag
+        element = ExtensibleUWSElement(config, pos, tag, **data)
+        element.parse(iterator, config)
+        setattr(self, tag_name.lower(), element)
+        return element
+
+
+class JobInfo(ExtensibleUWSElement):
+    """JobInfo that silently handles all child elements"""
+    def __init__(self, config=None, pos=None, _name='jobInfo', **kwargs):
         super().__init__(config, pos, _name, **kwargs)
