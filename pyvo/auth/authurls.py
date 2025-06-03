@@ -62,7 +62,7 @@ class AuthURLs():
         else:
             self.base_urls[url].add(security_method)
 
-    def allowed_auth_methods(self, url):
+    def allowed_auth_methods(self, url, combine_methods=False):
         """
         Return the authentication methods allowed for a particular URL.
         The methods are returned as URIs that represent security methods.
@@ -71,18 +71,43 @@ class AuthURLs():
         ----------
         url : str
             the URL to determine authentication methods
+        combine_methods : bool
+            If True combine methods from all matching URLs.
+            If False use only the most specific match.
         """
         logging.debug('Determining auth method for %s', url)
 
-        if url in self.full_urls:
-            methods = self.full_urls[url]
-            logging.debug('Matching full url %s, methods %s', url, methods)
-            return methods
+        if combine_methods:
+            combined_methods = set()
 
-        for base_url, methods in self._iterate_base_urls():
-            if url.startswith(base_url):
-                logging.debug('Matching base url %s, methods %s', base_url, methods)
+            for base_url, methods in self._iterate_base_urls():
+                if url.startswith(base_url):
+                    logging.debug('Matching base url %s, methods %s', base_url, methods)
+                    combined_methods.update(methods)
+
+            if url in self.full_urls:
+                methods = self.full_urls[url]
+                logging.debug('Matching full url %s, methods %s', url, methods)
+                combined_methods.update(methods)
+
+            # Return combined methods or anonymous if none found
+            if combined_methods:
+                logging.debug('Combined auth methods for %s: %s', url, combined_methods)
+                return combined_methods
+            else:
+                logging.debug('No matching URLs for %s, using anonymous auth', url)
+                return {securitymethods.ANONYMOUS}
+        else:
+            # In this case, the more specific case wins
+            if url in self.full_urls:
+                methods = self.full_urls[url]
+                logging.debug('Matching full url %s, methods %s', url, methods)
                 return methods
+
+            for base_url, methods in self._iterate_base_urls():
+                if url.startswith(base_url):
+                    logging.debug('Matching base url %s, methods %s', base_url, methods)
+                    return methods
 
         logging.debug('No match, using anonymous auth')
         return {securitymethods.ANONYMOUS}

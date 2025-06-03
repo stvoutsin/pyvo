@@ -21,10 +21,18 @@ class AuthSession:
     credentials are added to the request before it is sent.
     """
 
-    def __init__(self):
+    def __init__(self, combine_auth_methods=False):
+        """
+        Parameters
+        ----------
+        combine_auth_methods : bool
+            If True, combine authentication methods from all matching URLs.
+            If False, use only the most specific match.
+        """
         super().__init__()
         self.credentials = CredentialStore()
         self._auth_urls = AuthURLs()
+        self.combine_auth_methods = combine_auth_methods
 
     def add_security_method_for_url(self, url, security_method, exact=False):
         """
@@ -81,7 +89,7 @@ class AuthSession:
         """
         return self._request('DELETE', url, **kwargs)
 
-    def _request(self, http_method, url, **kwargs):
+    def _request(self, http_method, url, combine_methods=None, **kwargs):
         """
         Make an HTTP request with authentication.
 
@@ -97,8 +105,13 @@ class AuthSession:
             the HTTP verb of the request.
         url : str
             the URL to request
+        combine_methods : bool, optional
+            Override the instance setting for combining auth methods.
+            If None, uses the instance default.
         """
-        auth_methods = self._auth_urls.allowed_auth_methods(url)
+        should_combine = combine_methods if combine_methods is not None else self.combine_auth_methods
+
+        auth_methods = self._auth_urls.allowed_auth_methods(url, combine_methods=should_combine)
         logging.debug('Possible auth methods: %s', auth_methods)
 
         negotiated_method = self.credentials.negotiate_method(auth_methods)
