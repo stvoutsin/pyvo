@@ -74,18 +74,31 @@ class AuthURLs():
         """
         logging.debug('Determining auth method for %s', url)
 
-        if url in self.full_urls:
-            methods = self.full_urls[url]
-            logging.debug('Matching full url %s, methods %s', url, methods)
-            return methods
+        combined_methods = set()
 
         for base_url, methods in self._iterate_base_urls():
             if url.startswith(base_url):
                 logging.debug('Matching base url %s, methods %s', base_url, methods)
-                return methods
+                combined_methods.update(methods)
 
-        logging.debug('No match, using anonymous auth')
-        return {securitymethods.ANONYMOUS}
+        if url in self.full_urls:
+            methods = self.full_urls[url]
+            logging.debug('Matching full url %s, methods %s', url, methods)
+            combined_methods.update(methods)
+
+        if not combined_methods:
+            logging.debug('No match, using anonymous auth')
+            combined_methods = {securitymethods.ANONYMOUS}
+
+        logging.debug('Combined auth methods for %s: %s', url, combined_methods)
+
+        if len(combined_methods) > 1 and securitymethods.ANONYMOUS in combined_methods:
+            restricted_methods = combined_methods - {securitymethods.ANONYMOUS}
+            if restricted_methods:
+                logging.warning('URL %s allows both anonymous and restricted auth methods %s - verify this is intended',
+                                url, restricted_methods)
+
+        return combined_methods
 
     def _iterate_base_urls(self):
         """
