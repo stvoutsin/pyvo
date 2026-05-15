@@ -1039,7 +1039,7 @@ class Upload:
         """
         try:
             self._is_file = os.path.isfile(content)
-        except Exception:
+        except TypeError:
             self._is_file = False
         self._is_fileobj = hasattr(content, "read")
         self._is_table = isinstance(content, Table)

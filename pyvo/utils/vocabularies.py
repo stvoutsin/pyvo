@@ -45,7 +45,7 @@ def get_vocabulary(voc_name, force_update=False):
             cache=True,
             show_progress=False,
             http_headers={"accept": "application/x-desise+json"})
-    except Exception as msg:
+    except (OSError, ValueError) as msg:
         raise VocabularyError("No such vocabulary: {} ({})".format(
             voc_name, msg))
 
@@ -56,7 +56,7 @@ def get_vocabulary(voc_name, force_update=False):
                 IVOA_VOCABULARY_ROOT + voc_name,
                 cache="update", show_progress=False,
                 http_headers={"accept": "application/x-desise+json"})
-        except Exception as msg:
+        except (OSError, ValueError) as msg:
             warnings.warn("Updating cache for the vocabulary"
                           f" {voc_name} failed: {msg}",
                           category=PyvoUserWarning)

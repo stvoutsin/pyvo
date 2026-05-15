@@ -200,7 +200,7 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
             root = xml.etree.ElementTree.parse(
                 io.BytesIO(response.content)).getroot()
             example_elements = root.findall('.//*[@property="query"]')
-        except Exception as ex:
+        except xml.etree.ElementTree.ParseError as ex:
             raise DALServiceError.from_except(ex, examples_uri)
 
         examples = [TAPQuery(self.baseurl, example.text)
