@@ -4,6 +4,8 @@
 Enhancements and Fixes
 ----------------------
 
+- Change get_tables in regtap.py to use 2 calls instead of N + 1 [#750]
+
 - Support VOTableFile in accessible_table and broadcast_samp [#745]
 
 - Declaratively define new-style standard IDs in Servicetype constraint [#744]
