@@ -330,8 +330,10 @@ class _FakeResults:
     """
 
     def __init__(self, valdict):
+        from astropy.table import Table
         self.fieldnames = list(valdict.keys())
         self.resultstable = _NS(array=_NS(data=[list(valdict.values())]))
+        self._table = Table({k: [v] for k, v in valdict.items()})
 
 
 def get_regtap_results(**kwargs):
@@ -625,6 +627,7 @@ class _FakeResult:
     """
 
     def __init__(self, d):
+        from astropy.table import Table
         self.fieldnames = list(d.keys())
         vals = [regtap.TOKEN_SEP.join(v) if isinstance(v, list) else v
                 for v in d.values()]
@@ -634,6 +637,7 @@ class _FakeResult:
                 data = [vals]
 
         self.resultstable = _
+        self._table = Table({k: [v] for k, v in zip(self.fieldnames, vals)})
 
 
 def _makeRegistryRecord(**overrides):

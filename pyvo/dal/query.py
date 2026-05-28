@@ -32,6 +32,7 @@ from io import BytesIO, StringIO
 
 import collections
 
+import numpy
 from warnings import warn
 
 from astropy.table import Table, QTable
@@ -347,8 +348,10 @@ class DALResults:
             raise DALFormatError(
                 reason="VOTable response missing results table", url=url)
 
-        self._fldnames = tuple(
-            field.name for field in self._resultstable.fields)
+        self._fields = self._resultstable.fields
+        self._table = self._resultstable.to_table(use_names_over_ids=True)
+
+        self._fldnames = tuple(field.name for field in self._fields)
 
         if not self._fldnames:
             raise DALFormatError(
@@ -392,11 +395,11 @@ class DALResults:
             maxrec_to_check = client_set_maxrec if client_set_maxrec is not None else self._client_set_maxrec
 
             if (maxrec_to_check is not None
-                    and len(self.resultstable.array) == maxrec_to_check):
+                    and len(self._table) == maxrec_to_check):
                 pass
             else:
                 if maxrec_to_check is not None:
-                    warn(f"Results truncated at {len(self.resultstable.array)} records by service limits "
+                    warn(f"Results truncated at {len(self._table)} records by service limits "
                          f"(you requested maxrec={maxrec_to_check})",
                          category=DALOverflowWarning)
                 else:
@@ -485,7 +488,11 @@ class DALResults:
     @property
     def resultstable(self):
         """
-        The votable XML element `astropy.io.votable.tree.TableElement`
+        The votable XML element `astropy.io.votable.tree.TableElement`.
+
+        Note: for VOParquet responses this element carries field metadata only
+        and contains no row data. Use `to_table()` for row data and
+        `fielddescs` for field metadata.
         """
         return self._resultstable
 
@@ -497,7 +504,7 @@ class DALResults:
         -------
         `astropy.table.Table`
         """
-        return self.resultstable.to_table(use_names_over_ids=True)
+        return self._table
 
     def to_qtable(self):
         """
@@ -508,7 +515,7 @@ class DALResults:
         -------
         `astropy.table.QTable`
         """
-        return QTable(self.resultstable.to_table(use_names_over_ids=True))
+        return QTable(self._table)
 
     @property
     def table(self):
@@ -522,7 +529,7 @@ class DALResults:
         """
         return the record count
         """
-        return len(self.resultstable.array)
+        return len(self._table)
 
     def __getitem__(self, indx):
         """
@@ -552,7 +559,7 @@ class DALResults:
         a simple object with attributes corresponding the the VOTable FIELD
         attributes, namely: name, id, type, ucd, utype, arraysize, description
         """
-        return self.resultstable.fields
+        return self._fields
 
     @property
     def status(self):
@@ -597,9 +604,12 @@ class DALResults:
         """
         try:
             if name not in self.fieldnames:
-                name = self.resultstable.get_field_by_id(name).name
+                field = next((f for f in self._fields if f.ID == name), None)
+                if field is None:
+                    raise KeyError(name)
+                name = field.name
 
-            return self.resultstable.array[name]
+            return self._table[name]
         except KeyError:
             raise KeyError(f"No such column: {name}")
 
@@ -674,7 +684,7 @@ class DALResults:
         """
         if name not in self._fldnames:
             raise KeyError(name)
-        return self.resultstable.get_field_by_id_or_name(name)
+        return next((f for f in self._fields if f.ID == name or f.name == name), None)
 
     def __iter__(self):
         """
@@ -723,16 +733,17 @@ class Record(Mapping):
         self._index = index
         self._session = use_session(session)
         self._mapping = collections.OrderedDict(
-            zip(
-                results.fieldnames,
-                results.resultstable.array.data[index]
-            )
+            (name, numpy.ma.getdata(results._table[name])[index])
+            for name in results.fieldnames
         )
 
     def __getitem__(self, key):
         try:
             if key not in self._mapping:
-                key = self._results.resultstable.get_field_by_id(key).name
+                field = next((f for f in self._results._fields if f.ID == key), None)
+                if field is None:
+                    raise KeyError(key)
+                key = field.name
 
             return self._mapping[key]
         except KeyError:
