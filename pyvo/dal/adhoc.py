@@ -111,8 +111,8 @@ class AdhocServiceResultsMixin:
     Mixin for adhoc:service functionality for results classes.
     """
 
-    def __init__(self, votable, *, url=None, session=None):
-        super().__init__(votable, url=url, session=session)
+    def __init__(self, votable, *, url=None, session=None, **kwargs):
+        super().__init__(votable, url=url, session=session, **kwargs)
         self._adhocservices = list(
             resource for resource in votable.resources
             if resource.type == "meta" and resource.utype == "adhoc:service"

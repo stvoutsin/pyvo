@@ -12,10 +12,11 @@ import requests
 from urllib.parse import urlparse, urljoin
 
 from astropy.io.votable import parse as votableparse
+from astropy.table import Table
 
 from .query import (
     DALResults, DALQuery, DALService, Record, UploadList,
-    DALServiceError, DALQueryError)
+    DALServiceError, DALQueryError, DALFormatError)
 from .vosi import AvailabilityMixin, CapabilityMixin, VOSITables
 from .adhoc import DatalinkResultsMixin, DatalinkRecordMixin, SodaRecordMixin
 
@@ -51,6 +52,100 @@ DEFAULT_JOB_POLL_TIMEOUT = 10
 
 # Default timeout (in seconds) for overall job wait.
 DEFAULT_JOB_WAIT_TIMEOUT = 600.
+
+
+def _parse_parquet(data):
+    return Table.read(io.BytesIO(data), format="parquet.votable")
+
+
+def _extract_embedded_votable(data):
+    """Parse the VOTable schema embedded in a VOParquet file's metadata."""
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(io.BytesIO(data))
+    schema_metadata = pf.schema_arrow.metadata or {}
+    xml = schema_metadata.get(b'IVOA.VOTable-Parquet.content')
+    if xml is None:
+        raise DALFormatError(
+            reason="VOParquet file missing required IVOA.VOTable-Parquet.content metadata")
+    return votableparse(io.BytesIO(xml))
+
+
+def _handle_parquet(data, url, session, client_set_maxrec):
+    table = _parse_parquet(data)
+    embedded_vot = _extract_embedded_votable(data)
+    return TAPResults(table, url=url, session=session,
+                      client_set_maxrec=client_set_maxrec,
+                      embedded_votable=embedded_vot)
+
+
+_CONTENT_TYPE_PARSERS = {
+    "application/vnd.apache.parquet": _handle_parquet,
+    "application/x-parquet": _handle_parquet,
+}
+
+
+def _parse_tap_response(response, url, session, client_set_maxrec=None):
+    """Route a completed TAP response to the appropriate parser."""
+    mime = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+    handler = _CONTENT_TYPE_PARSERS.get(mime)
+    if handler:
+        data = response.content
+        try:
+            return handler(data, url, session, client_set_maxrec)
+        except ModuleNotFoundError as e:
+            raise ImportError(
+                "Reading VOParquet responses requires pyarrow and pandas. "
+                "Install them with: pip install pyarrow pandas"
+            ) from e
+        except DALFormatError:
+            raise
+        except Exception as e:
+            raise DALFormatError(e, url)
+
+    response.raw.read = partial(response.raw.read, decode_content=True)
+    try:
+        vot = votableparse(response.raw.read)
+    except Exception as e:
+        raise DALFormatError(e, url)
+    result = TAPResults(vot, url=url, session=session,
+                        client_set_maxrec=client_set_maxrec)
+    result.check_overflow_warning(client_set_maxrec)
+    return result
+
+
+class _ArrayAdapter:
+    """Adapts an astropy Table to the array interface used by DALResults."""
+    def __init__(self, table):
+        self._table = table
+        self.data = self
+
+    def __getitem__(self, index):
+        if isinstance(index, str):
+            return self._table[index]
+        row = self._table[index]
+        return tuple(row[col] for col in self._table.colnames)
+
+    def __len__(self):
+        return len(self._table)
+
+
+class _TableResultsAdapter:
+    """Combines a VOTable TableElement's field metadata with row data from an astropy Table."""
+    def __init__(self, parquet_table, votable_table):
+        self._parquet_table = parquet_table
+        self._votable_table = votable_table
+        self.fields = votable_table.fields
+        self.infos = votable_table.infos
+        self.array = _ArrayAdapter(parquet_table)
+
+    def to_table(self, use_names_over_ids=True):
+        return self._parquet_table
+
+    def get_field_by_id(self, name):
+        return self._votable_table.get_field_by_id(name)
+
+    def get_field_by_id_or_name(self, name):
+        return self._votable_table.get_field_by_id_or_name(name)
 
 
 def _from_ivoa_format(datetime_str):
@@ -265,7 +360,7 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
 
     def run_sync(
             self, query, *, language="ADQL", maxrec=None, uploads=None,
-            **keywords):
+            responseformat=None, **keywords):
         """
         runs sync query and returns its result
 
@@ -280,6 +375,8 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
             the maximum records to return. defaults to the service default
         uploads : dict
             a mapping from table names to objects containing a votable
+        responseformat : str, optional
+            the response format MIME type (e.g. ``"application/vnd.apache.parquet"``).
 
         Returns
         -------
@@ -292,14 +389,15 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
         """
         return self.create_query(
             query, language=language, maxrec=maxrec, uploads=uploads,
-            **keywords).execute()
+            responseformat=responseformat, **keywords).execute()
 
     # alias for service discovery
     search = run_sync
 
     def run_async(
             self, query, *, language="ADQL", maxrec=None, uploads=None,
-            delete=True, timeout=DEFAULT_JOB_WAIT_TIMEOUT, **keywords):
+            responseformat=None, delete=True, timeout=DEFAULT_JOB_WAIT_TIMEOUT,
+            **keywords):
         """
         runs async query and returns its result
 
@@ -314,6 +412,8 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
             the maximum records to return. defaults to the service default
         uploads : dict
             a mapping from table names to objects containing a votable
+        responseformat : str, optional
+            the response format MIME type (e.g. ``"application/vnd.apache.parquet"``).
         delete : bool
             delete the job after fetching the results
         timeout : float
@@ -321,8 +421,8 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
 
         Returns
         -------
-        TAPResult
-            the query instance
+        TAPResults
+            the query result
 
         Raises
         ------
@@ -332,7 +432,7 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
            for errors either in the input query syntax or
            other user errors detected by the service
         DALFormatError
-           for errors parsing the VOTable response
+           for errors parsing the response
 
         See Also
         --------
@@ -340,7 +440,7 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
         """
         job = AsyncTAPJob.create(
             self.baseurl, query, language=language, maxrec=maxrec, uploads=uploads,
-            session=self._session, **keywords)
+            responseformat=responseformat, session=self._session, **keywords)
         job = job.run().wait(timeout=timeout)
 
         try:
@@ -359,7 +459,7 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
 
     def submit_job(
             self, query, *, language="ADQL", maxrec=None, uploads=None,
-            **keywords):
+            responseformat=None, **keywords):
         """
         submit a async query without starting it and returns a AsyncTAPJob
         object
@@ -375,6 +475,8 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
             the maximum records to return. defaults to the service default
         uploads : dict
             a mapping from table names to objects containing a votable
+        responseformat : str, optional
+            the response format MIME type (e.g. ``"application/vnd.apache.parquet"``).
 
         Returns
         -------
@@ -387,11 +489,11 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
         """
         return AsyncTAPJob.create(
             self.baseurl, query, language=language, maxrec=maxrec, uploads=uploads,
-            session=self._session, **keywords)
+            responseformat=responseformat, session=self._session, **keywords)
 
     def create_query(
             self, query=None, *, mode="sync", language="ADQL", maxrec=None,
-            uploads=None, **keywords):
+            uploads=None, responseformat=None, **keywords):
         """
         create a query object that constraints can be added to and then
         executed.  The input arguments will initialize the query with the
@@ -411,7 +513,11 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
             defaults to the service default.
         uploads : dict
             a mapping from table names to objects containing a votable.
+        responseformat : str, optional
+            the response format MIME type (e.g. ``"application/vnd.apache.parquet"``).
         """
+        if responseformat is not None:
+            keywords["responseformat"] = responseformat
         return TAPQuery(
             self.baseurl, query, mode=mode, language=language, maxrec=maxrec,
             uploads=uploads, session=self._session, **keywords)
@@ -644,7 +750,7 @@ class AsyncTAPJob:
     @classmethod
     def create(
             cls, baseurl, query, *, language="ADQL", maxrec=None, uploads=None,
-            session=None, **keywords):
+            responseformat=None, session=None, **keywords):
         """
         creates a async tap job on the server under ``baseurl``
 
@@ -661,9 +767,13 @@ class AsyncTAPJob:
             the maximum records to return. defaults to the service default
         uploads : dict
             a mapping from table names to objects containing a votable
+        responseformat : str, optional
+            the response format MIME type (e.g. ``"application/vnd.apache.parquet"``).
         session : object
            optional session to use for network requests
         """
+        if responseformat is not None:
+            keywords["responseformat"] = responseformat
         tapquery = TAPQuery(
             baseurl, query, mode="async", language=language, maxrec=maxrec,
             uploads=uploads, session=session, **keywords)
@@ -1091,10 +1201,8 @@ class AsyncTAPJob:
                 self.raise_if_error()
                 raise DALServiceError.from_except(ex, self.url)
 
-        response.raw.read = partial(response.raw.read, decode_content=True)
-        result = TAPResults(votableparse(response.raw.read), url=self.result_uri, session=self._session)
-        result.check_overflow_warning(self._client_set_maxrec)
-        return result
+        return _parse_tap_response(
+            response, self.result_uri, self._session, self._client_set_maxrec)
 
 
 class TAPQuery(DALQuery):
@@ -1173,7 +1281,7 @@ class TAPQuery(DALQuery):
 
     def execute_stream(self, *, post=False):
         """
-        submit the query and return the raw VOTable XML as a file stream
+        submit the query and return the raw response as a file stream
 
         Raises
         ------
@@ -1192,7 +1300,7 @@ class TAPQuery(DALQuery):
 
     def execute(self):
         """
-        submit the query and return the results as a TAPResults instance
+        submit the query and return the results as a TAPResults instance.
 
         Raises
         ------
@@ -1202,22 +1310,30 @@ class TAPQuery(DALQuery):
            for errors either in the input query syntax or
            other user errors detected by the service
         DALFormatError
-           for errors parsing the VOTable response
+           for errors parsing the response
         """
-        result = TAPResults(
-            self.execute_votable(),
-            url=self.queryurl,
-            session=self._session
-        )
-        result.check_overflow_warning(self._client_set_maxrec)
-
-        return result
+        # execute_stream() is intentionally bypassed, format dispatch in
+        # _parse_tap_response requires the full requests.Response object
+        # (for the Content-Type header), whereas execute_stream() returns
+        # only response.raw and discards the header information.
+        if self._mode != "sync":
+            raise DALServiceError(
+                "Cannot execute a non-synchronous query. Use submit instead")
+        self._ex = None
+        response = self.submit()
+        try:
+            response.raise_for_status()
+        except requests.RequestException as ex:
+            self._ex = DALServiceError.from_except(ex, self.queryurl)
+        self.raise_if_error()
+        return _parse_tap_response(
+            response, self.queryurl, self._session, self._client_set_maxrec)
 
     def submit(self, *, post=False):
         """
         Does the request part of the TAP query.
         This function is separated from response parsing because async queries
-        return no votable but behave like sync queries in terms of request.
+        return no result body but behave like sync queries in terms of request.
         It returns the requests response.
         """
         url = self.queryurl
@@ -1230,22 +1346,20 @@ class TAPQuery(DALQuery):
 
         response = self._session.post(
             url, data=self, stream=True, files=files)
-        # requests doesn't decode the content by default
-        response.raw.read = partial(response.raw.read, decode_content=True)
         return response
 
 
 class TAPResults(DatalinkResultsMixin, DALResults):
     """
-    The list of matching images resulting from an image (SIA) query.
+    The list of records resulting from a TAP query.
     Each record contains a set of metadata that describes an available
-    image matching the query constraints.  The number of records in
+    result matching the query constraints.  The number of records in
     the results is available by passing it to the Python built-in ``len()`` function.
 
     This class supports iterable semantics; thus,
     individual records (in the form of
     :py:class:`~pyvo.dal.Record` instances) are typically
-    accessed by iterating over an ``TAPResults`` instance.
+    accessed by iterating over a ``TAPResults`` instance.
 
     Alternatively, records can be accessed randomly via
     :py:meth:`getrecord` or through a Python Database API (v2)
@@ -1256,7 +1370,7 @@ class TAPResults(DatalinkResultsMixin, DALResults):
     ``TAPResults`` is essentially a wrapper around an Astropy
     :py:mod:`~astropy.io.votable`
     :py:class:`~astropy.io.votable.tree.TableElement` instance where the
-    columns contain the various metadata describing the images.
+    columns contain the various metadata describing the query results.
     One can access that VOTable directly via the
     :py:attr:`pyvo.dal.DALResults.votable` attribute.  Thus,
     when one retrieves a whole column via
@@ -1267,7 +1381,7 @@ class TAPResults(DatalinkResultsMixin, DALResults):
 
     ``table = results.to_table``
 
-    ``SIAResults`` supports the array item operator ``[...]`` in a
+    ``TAPResults`` supports the array item operator ``[...]`` in a
     read-only context.  When the argument is numerical, the result
     is an
     :py:class:`~pyvo.dal.Record` instance, representing the
@@ -1276,6 +1390,34 @@ class TAPResults(DatalinkResultsMixin, DALResults):
     and the data from the column matching that name is returned as
     a Numpy array.
     """
+
+    def __init__(self, votable, *, url=None, session=None, client_set_maxrec=None,
+                 embedded_votable=None):
+        if isinstance(votable, Table):
+            # VOParquet path: store the Parquet data table, then init using the
+            # embedded VOTable.
+            self._parquet_table = votable
+            super().__init__(embedded_votable, url=url, session=session,
+                             client_set_maxrec=client_set_maxrec)
+        else:
+            self._parquet_table = None
+            super().__init__(votable, url=url, session=session,
+                             client_set_maxrec=client_set_maxrec)
+
+    def _findresultstable(self, votable):
+        if self._parquet_table is not None:
+            return _TableResultsAdapter(self._parquet_table,
+                                        super()._findresultstable(votable))
+        return super()._findresultstable(votable)
+
+    def broadcast_samp(self, *, client_name=None):
+        """
+        Broadcast the table to ``client_name`` via SAMP.
+        """
+        from .. import samp
+        with samp.connection() as conn:
+            data = self.to_table() if self._parquet_table is not None else self._votable
+            samp.send_table_to(conn, data, client_name=client_name, name=self.queryurl)
 
     @property
     def infos(self):
@@ -1295,8 +1437,7 @@ class TAPResults(DatalinkResultsMixin, DALResults):
         """
         return a representation of a tap result record that follows
         dictionary semantics. The keys of the dictionary are those returned by
-        this instance's fieldnames attribute. The returned record has
-        additional image-specific properties
+        this instance's fieldnames attribute.
 
         Parameters
         ----------
@@ -1306,7 +1447,7 @@ class TAPResults(DatalinkResultsMixin, DALResults):
 
         Returns
         -------
-        REc
+        TAPRecord
            a dictionary-like wrapper containing the result record metadata.
 
         Raises
